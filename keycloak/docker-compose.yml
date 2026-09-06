@@ -1,0 +1,25 @@
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HTTP_PORT: "8080"
+      KC_HOSTNAME_STRICT: "false"
+      # The widget's own local dev server (server/index.js) only ever serves HTTPS (self-signed
+      # cert.pem/key.pem, already committed in this repo), and an HTTPS page cannot fetch() an
+      # HTTP token endpoint (mixed content — this blocks the actual token exchange, not just the
+      # top-level OAuth redirects, which browsers exempt from mixed-content blocking). Reusing
+      # the SAME cert here, rather than generating a separate one, means there's exactly one
+      # self-signed CA to click through per browser profile, not two different ones.
+      KC_HTTPS_CERTIFICATE_FILE: /opt/keycloak/certs/cert.pem
+      KC_HTTPS_CERTIFICATE_KEY_FILE: /opt/keycloak/certs/key.pem
+      KC_HTTPS_PORT: "8443"
+    ports:
+      - "8080:8080"   # plain HTTP — admin console / discovery doc, no cert warning
+      - "8443:8443"   # HTTPS — what the widget's KC_PRESETS.local actually targets
+    volumes:
+      - ./realm-export.json:/opt/keycloak/data/import/realm-sidedrawer-dev.json:ro
+      - ../cert.pem:/opt/keycloak/certs/cert.pem:ro
+      - ../key.pem:/opt/keycloak/certs/key.pem:ro

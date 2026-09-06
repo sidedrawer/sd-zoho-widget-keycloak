@@ -1,0 +1,1878 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SideDrawer Integration</title>
+    <!-- Zoho CRM SDK -->
+    <script src="https://live.zwidgets.com/js-sdk/1.2/ZohoEmbededAppSDK.min.js"></script>
+    <!-- Stripe.js for PCI-compliant payment processing -->
+    <script src="https://js.stripe.com/v3/"></script>
+    <!-- External CSS -->
+    <link rel="stylesheet" href="widget.css">
+    <!-- Tenant Creation Wizard (non-logged-in) -->
+    <script src="tenant-wizard.js"></script>
+    <!-- Tenant Creation Wizard (logged-in) -->
+    <script src="tenant-wizard-with-credentials.js"></script>
+  </head>
+  <body>
+    <div class="container">
+      <div class="header">
+        <h1>SideDrawer Integration</h1>
+      </div>
+
+      <div id="app-content">
+        <div class="loading">
+          <div class="spinner"></div>
+          <p>Initializing connection...</p>
+        </div>
+      </div>
+      
+      <!-- Tenant Creation Wizard Container (hidden by default) -->
+      <div id="tenant-wizard" class="hidden"></div>
+    </div>
+
+      <script>
+      // Read URL parameters for initial config
+      const urlParams = new URLSearchParams(window.location.search);
+      const isOAuthCallback = urlParams.has('code') || urlParams.has('error');
+
+      // On an OAuth callback the URL carries only ?code&state — no client_id, realm or
+      // redirect_uri — and a popup does not reliably inherit sessionStorage. Decode `state`
+      // BEFORE anything reads config, so every value below resolves from it instead of
+      // silently falling back to another realm's defaults.
+      //
+      // Getting this wrong is subtle and expensive: the wrong realm is chosen, and the code is
+      // then POSTed to the wrong realm's token endpoint. Keycloak answers 400 invalid_grant with
+      // no Access-Control-Allow-Origin, which the browser reports as "blocked by CORS policy" —
+      // pointing the investigation at CORS rather than at the realm.
+      const callbackState = (() => {
+        if (!isOAuthCallback) return null;
+        const raw = urlParams.get('state');
+        if (!raw) return null;
+        try {
+          return JSON.parse(atob(raw));
+        } catch (e) {
+          console.warn('⚠ Could not decode OAuth state:', e.message);
+          return null;
+        }
+      })();
+      
+      // Helper to get config param (from URL or sessionStorage)
+      function getConfigParam(key) {
+        // If URL has param, use and store it
+        if (urlParams.has(key)) {
+          const value = urlParams.get(key);
+          if (!isOAuthCallback) {
+            sessionStorage.setItem('sd_config_' + key, value);
+          }
+          return value;
+        }
+        // Otherwise try sessionStorage
+        return sessionStorage.getItem('sd_config_' + key) || null;
+      }
+      
+      // Named Keycloak realm presets, used only when keycloak_url+realm are not explicitly
+      // supplied via URL param, sessionStorage, or Zoho config variables. clientId here is a
+      // public OAuth identifier (not a secret), so hardcoding it is safe — see README security
+      // notes. `env` is used only to route API hosts (window.sdHosts()) — it has no bearing on
+      // which Keycloak realm is used.
+      //
+      // Only 'local' (the bundled docker-compose realm — see keycloak/README.md) ships here.
+      // This file is a generic template, not tied to any one customer's Keycloak deployment —
+      // add real environment presets (production/sandbox/etc.) here once those hosts/realms are
+      // known, or just pass keycloak_url+realm explicitly and skip presets entirely.
+      const KC_PRESETS = {
+        'local': { base: 'https://localhost:8443', realm: 'sidedrawer-dev', clientId: 'zoho-widget', env: 'development' }
+      };
+      const DEFAULT_PRESET = 'local';
+
+      const explicitClientId = (callbackState && callbackState.clientId) || getConfigParam('client_id');
+      const explicitRedirectUri = (callbackState && callbackState.redirectUri) || getConfigParam('redirect_uri');
+      const explicitKeycloakUrl = (callbackState && callbackState.keycloakUrl) || getConfigParam('keycloak_url');
+      const explicitRealm = (callbackState && callbackState.realm) || getConfigParam('realm');
+      const explicitPreset = (callbackState && callbackState.preset) || getConfigParam('preset');
+      const explicitIdpHint = (callbackState && callbackState.idpHint) || getConfigParam('idp_hint');
+      // True whenever no client_id was ever explicitly supplied (URL now, or cached from an
+      // earlier URL this session). Gates tenant creation — see showConnectedStatus/showDisconnectedStatus.
+      let usingDefaultClientId = !explicitClientId;
+
+      // API hosts per environment. `env` here is purely a routing label for these API hosts —
+      // it is unrelated to which Keycloak realm/issuer is in use, so a bridge iframe recovering
+      // an unfamiliar realm from a stored token can still resolve API hosts correctly as long as
+      // it can place that realm's origin in one of the presets below (see envForOrigin).
+      const API_HOSTS = {
+        production:  { api: 'https://api.sidedrawer.com',        tenants: 'https://tenants-gateway-api.sidedrawer.com',        userApi: 'https://user-api.sidedrawer.com',        console: 'https://console.sidedrawer.com' },
+        sandbox:     { api: 'https://api-sbx.sidedrawersbx.com', tenants: 'https://tenants-gateway-api-sbx.sidedrawersbx.com', userApi: 'https://user-api-sbx.sidedrawersbx.com', console: 'https://console-sbx.sidedrawersbx.com' },
+        development: { api: 'https://api-dev.sidedrawerdev.com', tenants: 'https://tenants-gateway-api-dev.sidedrawerdev.com', userApi: 'https://user-api-dev.sidedrawerdev.com', console: 'https://console-dev.sidedrawerdev.com' }
+      };
+
+      /**
+       * API hosts for the environment currently in OAUTH_CONFIG.
+       * Keyed directly off OAUTH_CONFIG.env — NOT off `audience` (Keycloak has none). Every
+       * OAUTH_CONFIG mutation below must keep `env` correct, or every API call site in this
+       * file and both tenant wizards silently hits the wrong environment's hosts with a
+       * perfectly valid token — no error, just wrong data.
+       * Lazily called, because tenant-wizard*.js load before this inline script runs.
+       */
+      window.sdHosts = function sdHosts() {
+        const env = (typeof OAUTH_CONFIG !== 'undefined' && OAUTH_CONFIG.env) || 'sandbox';
+        return API_HOSTS[env] || API_HOSTS.sandbox;
+      };
+
+      /** Match an issuer's origin against the known presets, to label it with an API-routing env. */
+      function envForOrigin(origin) {
+        const o = (origin || '').toLowerCase();
+        for (const cfg of Object.values(KC_PRESETS)) {
+          try {
+            if (new URL(cfg.base).origin.toLowerCase() === o) return cfg.env;
+          } catch (e) { /* skip a malformed preset rather than failing detection */ }
+        }
+        return null;
+      }
+
+      /** Build the standard Keycloak OIDC endpoint set from an issuer string. */
+      function issuerToEndpoints(issuer) {
+        return {
+          issuer,
+          authorizationEndpoint: `${issuer}/protocol/openid-connect/auth`,
+          tokenEndpoint: `${issuer}/protocol/openid-connect/token`,
+          logoutEndpoint: `${issuer}/protocol/openid-connect/logout`,
+          revokeEndpoint: `${issuer}/protocol/openid-connect/revoke`
+        };
+      }
+
+      /** Point OAUTH_CONFIG at one Keycloak issuer directly. Does not change OAUTH_CONFIG.env. */
+      function applyIssuerToConfig(issuer, realm, reason) {
+        Object.assign(OAUTH_CONFIG, issuerToEndpoints(issuer));
+        if (realm) OAUTH_CONFIG.realm = realm;
+        console.log(`[SideDrawer Widget] 🔧 OAUTH_CONFIG → issuer=${issuer}${reason ? ` (${reason})` : ''}`);
+      }
+
+      /** Point OAUTH_CONFIG at a named realm preset. Unknown presets resolve to 'local'. */
+      function applyPresetToConfig(presetName, reason) {
+        const resolved = KC_PRESETS[presetName] ? presetName : DEFAULT_PRESET;
+        const cfg = KC_PRESETS[resolved];
+        applyIssuerToConfig(`${cfg.base}/realms/${cfg.realm}`, cfg.realm, `${reason || 'preset'}: ${resolved}`);
+        OAUTH_CONFIG.env = cfg.env;
+        if (!OAUTH_CONFIG.clientId && cfg.clientId) {
+          OAUTH_CONFIG.clientId = cfg.clientId;
+          usingDefaultClientId = true;
+        }
+      }
+
+      // OAuth2 Configuration — populated below from explicit params or a named preset.
+      const OAUTH_CONFIG = {
+        issuer: null,
+        authorizationEndpoint: null,
+        tokenEndpoint: null,
+        logoutEndpoint: null,
+        revokeEndpoint: null,
+        clientId: explicitClientId || null,
+        realm: explicitRealm || null,
+        env: 'development',
+        redirectUri: explicitRedirectUri || (window.location.origin + window.location.pathname.split('?')[0]),
+        scope: 'openid profile email offline_access',
+        idpHint: explicitIdpHint || null
+      };
+
+      // Resolve the realm: an explicit keycloak_url+realm pair wins outright; otherwise fall
+      // back to a named preset (from URL/state/Zoho config, defaulting to 'local').
+      if (explicitKeycloakUrl && explicitRealm) {
+        const base = explicitKeycloakUrl.replace(/\/$/, '');
+        applyIssuerToConfig(`${base}/realms/${explicitRealm}`, explicitRealm, 'from explicit keycloak_url+realm');
+        OAUTH_CONFIG.env = envForOrigin(new URL(base).origin)
+          || getConfigParam('environment') || getConfigParam('env') || 'sandbox';
+      } else {
+        const presetParam = explicitPreset || getConfigParam('environment') || getConfigParam('env') || DEFAULT_PRESET;
+        applyPresetToConfig(presetParam, 'from URL param');
+      }
+
+      // Default redirect_uri when not explicitly supplied AND client_id is also defaulted:
+      // self URL + resolved client_id, matching the exact pattern already used when
+      // client_id/redirect_uri are passed manually. Gated on usingDefaultClientId (not just
+      // OAUTH_CONFIG.clientId) so that an explicitly-supplied client_id with no redirect_uri
+      // keeps its original fallback (bare self URL) — unchanged from before this feature.
+      if (!explicitRedirectUri && usingDefaultClientId && OAUTH_CONFIG.clientId) {
+        const selfUrl = window.location.origin + window.location.pathname.split('?')[0];
+        OAUTH_CONFIG.redirectUri = `${selfUrl}?client_id=${OAUTH_CONFIG.clientId}`;
+      }
+
+      // Persist wizard-specific params through OAuth redirect so they survive the round-trip.
+      // `configuredStripePriceId` also gates tenant creation below — read once here, since
+      // neither the URL nor sessionStorage changes for the rest of this page's lifetime.
+      const configuredStripePriceId = getConfigParam('stripe_price');
+      getConfigParam('coupon_id');
+
+      // Tenant creation requires TWO things:
+      // 1. A dedicated SideDrawer Client ID (OAuth app tied to one customer/brand) — hide the
+      //    button while running on the shared default client_id, since creating a tenant under
+      //    the shared app would be wrong.
+      // 2. A pre-configured stripe_price — this flow has no manual plan-picker UI (see
+      //    applyDefaultSubscriptionSelection in the wizards), so with no price configured the
+      //    button would lead into a wizard with nothing valid to submit.
+      // Used by showDisconnectedStatus() and showConnectedStatus().
+      function getTenantCreationButtonHtml(btnClass) {
+        if (usingDefaultClientId || !configuredStripePriceId) return '';
+        return `<button class="${btnClass}" onclick="auth.showTenantCreationFlow()">Create New Tenant</button>`;
+      }
+      
+      // Log initial configuration
+      console.log('🔧 Initial OAuth Config (PKCE - NO CLIENT SECRET):');
+      console.log('  Client ID:', OAUTH_CONFIG.clientId ? 'Set' : 'NOT SET');
+      console.log('  Redirect URI:', OAUTH_CONFIG.redirectUri);
+      console.log('  Is OAuth Callback:', isOAuthCallback);
+
+      // Storage keys
+      const STORAGE_KEYS = {
+        refreshToken: 'sidedrawer_refresh_token', // Persistent in localStorage
+        codeVerifier: 'sidedrawer_code_verifier'
+      };
+
+      const ZOHO_SESSION_KEY = 'sdSession'; // Zoho session storage key
+
+      // Parse a Keycloak access token's `iss` claim into {issuer, origin, realm}. Unlike Auth0,
+      // Keycloak's iss is `https://host/realms/<realm>` — the host alone is not unique once
+      // realms are per-brand, so both the origin AND the realm segment must be extracted.
+      // Tolerates the legacy `/auth/realms/<realm>` relative-path variant.
+      function parseIssuer(token) {
+        try {
+          const b64 = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+          const payload = JSON.parse(atob(b64));
+          const iss = payload.iss || '';
+          if (!iss) return null;
+          let url;
+          try { url = new URL(iss); } catch (e) { return null; }
+          const match = url.pathname.match(/\/realms\/([^/]+)\/?$/);
+          if (!match) return null;
+          return {
+            issuer: iss.replace(/\/$/, ''),
+            origin: url.origin.toLowerCase(),
+            realm: match[1] // realm names are case-sensitive — do not lowercase this
+          };
+        } catch (e) {
+          return null;
+        }
+      }
+
+      // Detect environment (for API-host routing only — see envForOrigin) from a JWT's iss.
+      // Independent of URL params or Zoho config, and authoritative over them: the bridge
+      // iframe's URL may have been built with the wrong/default env, but the actual issuer in
+      // a stored token is ground truth. Returns null (never a legacy guess) when the issuer's
+      // origin matches no known preset — see envForOrigin for why guessing would be wrong here.
+      function detectEnvFromJWT(token) {
+        const parsed = parseIssuer(token);
+        if (!parsed) return null;
+        return envForOrigin(parsed.origin);
+      }
+
+      // Read a stored session and align OAUTH_CONFIG with the realm that actually issued its
+      // token. This is the ONLY way the bridge iframe (which never logs in and never receives
+      // a `realm` from its URL — see SidedrawerRelated's session bridge) can refresh a token for
+      // an unfamiliar brand's realm: it reads the issuer straight off the persisted session or,
+      // failing that, re-parses it from the access token itself.
+      function syncConfigFromStoredSession() {
+        try {
+          const raw = localStorage.getItem(ZOHO_SESSION_KEY);
+          if (!raw) return null;
+          const session = JSON.parse(raw);
+          const token = session.accessToken;
+          if (!token) return null;
+          const parsed = parseIssuer(token);
+          const issuer = session.issuer || (parsed && parsed.issuer);
+          const realm = session.realm || (parsed && parsed.realm);
+          if (!issuer) return null;
+          applyIssuerToConfig(issuer, realm, 'from stored session');
+          let origin = null;
+          try { origin = new URL(issuer).origin; } catch (e) { /* leave null */ }
+          const env = envForOrigin(origin);
+          if (env) OAUTH_CONFIG.env = env;
+          return { issuer, realm, env: env || OAUTH_CONFIG.env };
+        } catch (e) {
+          console.warn('[SideDrawer Widget] Could not sync config from stored session:', e.message);
+          return null;
+        }
+      }
+
+      // Full issuer (base + /realms/<realm>) currently in OAUTH_CONFIG — used to build the
+      // Keycloak logout/revoke endpoints, which live under the issuer, not the bare host.
+      function getIssuer() {
+        return OAUTH_CONFIG.issuer;
+      }
+
+      // POST to a Keycloak OIDC endpoint (token/revoke). Keycloak requires
+      // application/x-www-form-urlencoded — a JSON body is rejected with
+      // 400 invalid_request "Missing form parameter: grant_type". The null/undefined/empty
+      // guard matters: URLSearchParams would otherwise serialize an unset value as the literal
+      // string "undefined" (e.g. client_id=undefined), which Keycloak rejects as invalid_client.
+      async function postForm(endpoint, params) {
+        const body = new URLSearchParams();
+        for (const [key, value] of Object.entries(params)) {
+          if (value !== undefined && value !== null && value !== '') {
+            body.append(key, value);
+          }
+        }
+        return fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: body.toString()
+        });
+      }
+
+      // Parse a Keycloak token-endpoint error response ({error, error_description}) into a
+      // message. Keycloak puts the actionable detail in error_description (e.g. "Session not
+      // active", "Offline session not active", "Invalid refresh token") — surfacing only the
+      // HTTP status, as the original Auth0 code did, throws away the one piece of information
+      // that distinguishes a terminal failure from a transient one.
+      async function parseTokenErrorResponse(response) {
+        const responseText = await response.text().catch(() => '');
+        let errorData;
+        try {
+          errorData = JSON.parse(responseText);
+        } catch (e) {
+          errorData = { error: 'parse_error', raw: responseText };
+        }
+        const message = errorData.error_description || errorData.error || `Token request failed: ${response.status}`;
+        return { errorData, message };
+      }
+
+      class SideDrawerAuth {
+        constructor() {
+          this.zohoInitialized = false;
+          this.refreshInterval = null;
+          this.initZoho();
+        }
+
+        async initZoho() {
+          // Helper function to extract client_id from sd_config_redirect_uri sessionStorage
+          const extractClientIdFromRedirectUri = () => {
+            const redirectUri = sessionStorage.getItem('sd_config_redirect_uri');
+            if (redirectUri) {
+              try {
+                const url = new URL(redirectUri);
+                const clientId = url.searchParams.get('client_id');
+                if (clientId) {
+                  console.log('[SideDrawer Widget] ✓ Extracted client_id from redirect_uri:', clientId);
+                  return clientId;
+                }
+              } catch (e) {
+                console.warn('[SideDrawer Widget] Failed to parse redirect_uri:', e);
+              }
+            }
+            return null;
+          };
+          
+          // Helper function to get client_id from multiple sources
+          const getClientId = () => {
+            // Priority 1: URL params
+            const urlClientId = urlParams.get('client_id');
+            if (urlClientId) {
+              return urlClientId;
+            }
+            
+            // Priority 2: Extract from sd_config_redirect_uri
+            const redirectUriClientId = extractClientIdFromRedirectUri();
+            if (redirectUriClientId) {
+              return redirectUriClientId;
+            }
+            
+            // Priority 3: From OAUTH_CONFIG (which may have been set from sessionStorage)
+            if (OAUTH_CONFIG.clientId) {
+              return OAUTH_CONFIG.clientId;
+            }
+            
+            // Priority 4: clientId stored in sdSession from a previous successful session
+            const storedSession = localStorage.getItem('sdSession');
+            if (storedSession) {
+              try {
+                const parsed = JSON.parse(storedSession);
+                if (parsed.clientId) return parsed.clientId;
+              } catch (e) {}
+            }
+            
+            return null;
+          };
+          
+          // When loaded in Zoho, respond to postMessage requests for session data
+          window.addEventListener('message', async (event) => {
+            // Handle REFRESH_SIDEDRAWER_TOKEN message
+            if (event.data && event.data.type === 'REFRESH_SIDEDRAWER_TOKEN') {
+              console.log('[SideDrawer Widget] 🔄 Received token refresh request');
+              
+              try {
+                // Override OAUTH_CONFIG (issuer, realm, env) based on the stored session's
+                // Keycloak issuer — the ONLY way this bridge iframe (no `realm` in its URL,
+                // no Zoho SDK) can know which realm to refresh against. See syncConfigFromStoredSession.
+                const syncedConfig = syncConfigFromStoredSession();
+                const detectedEnv = syncedConfig && syncedConfig.env;
+
+                // Get client_id from multiple sources
+                const clientId = getClientId();
+                
+                if (!clientId) {
+                  throw new Error('client_id not found in URL params, redirect_uri, or sessionStorage');
+                }
+                
+                // Update OAUTH_CONFIG.clientId if needed
+                if (!OAUTH_CONFIG.clientId) {
+                  OAUTH_CONFIG.clientId = clientId;
+                  console.log('[SideDrawer Widget] ✓ Set OAUTH_CONFIG.clientId from getClientId():', clientId);
+                }
+                
+                console.log('[SideDrawer Widget] Client ID for refresh:', clientId);
+                
+                // Call the existing refreshAccessToken method
+                await this.refreshAccessToken();
+                
+                // Get the refreshed session
+                const refreshedSession = await this.getZohoSession();
+                
+                if (refreshedSession && refreshedSession.accessToken) {
+                  // Ensure clientId is in session
+                  if (!refreshedSession.clientId) {
+                    refreshedSession.clientId = clientId;
+                  }
+                  // Stamp env from JWT detection (authoritative) rather than URL/preset default
+                  refreshedSession.env = detectedEnv || OAUTH_CONFIG.env;
+                  
+                  console.log('[SideDrawer Widget] ✅ Token refreshed successfully');
+                  console.log('[SideDrawer Widget] New token expires at:', refreshedSession.expiresAt ? new Date(parseInt(refreshedSession.expiresAt)).toISOString() : 'N/A');
+                  
+                  // Send refreshed session back to parent
+                  window.parent.postMessage({
+                    type: 'SIDEDRAWER_SESSION_RESPONSE',
+                    session: refreshedSession
+                  }, '*');
+                } else {
+                  throw new Error('Failed to get refreshed session after token refresh');
+                }
+                
+              } catch (error) {
+                console.error('[SideDrawer Widget] ❌ Token refresh error:', error);
+                window.parent.postMessage({
+                  type: 'SIDEDRAWER_SESSION_RESPONSE',
+                  session: null,
+                  error: error.message
+                }, '*');
+              }
+              
+              return; // Exit early, don't process REQUEST_SIDEDRAWER_SESSION
+            }
+            
+            // Handle REQUEST_SIDEDRAWER_SESSION message
+            if (event.data && event.data.type === 'REQUEST_SIDEDRAWER_SESSION') {
+              console.log('📥 Received session request from parent window');
+              // Align OAUTH_CONFIG (issuer/realm/env) with the stored session so any subsequent
+              // refresh uses the right realm — see syncConfigFromStoredSession.
+              syncConfigFromStoredSession();
+              const session = localStorage.getItem('sdSession');
+              if (session) {
+                try {
+                  const sessionData = JSON.parse(session);
+                  
+                  // Ensure clientId is in session (extract from multiple sources if missing)
+                  if (!sessionData.clientId) {
+                    const clientId = getClientId();
+                    if (clientId) {
+                      sessionData.clientId = clientId;
+                    }
+                  }
+
+                  // Stamp env from JWT detection (authoritative) so SidedrawerRelated syncs correctly
+                  const jwtEnv = detectEnvFromJWT(sessionData.accessToken);
+                  sessionData.env = jwtEnv || sessionData.env || OAUTH_CONFIG.env;
+
+                  // Persist any additions back to localStorage
+                  localStorage.setItem('sdSession', JSON.stringify(sessionData));
+
+                  window.parent.postMessage({
+                    type: 'SIDEDRAWER_SESSION_RESPONSE',
+                    session: sessionData
+                  }, '*');
+                  console.log('📤 Sent session to parent window');
+                } catch (e) {
+                  console.error('Failed to parse/send session:', e);
+                }
+              } else {
+                console.log('⚠ No session available to send');
+                // Send null session response
+                window.parent.postMessage({
+                  type: 'SIDEDRAWER_SESSION_RESPONSE',
+                  session: null
+                }, '*');
+              }
+            }
+          });
+          
+          console.log('✅ Session bridge ready (localStorage only, no Zoho SDK needed)');
+          
+          try {
+            // Set up message listener for OAuth popup callback
+            window.addEventListener('message', async (event) => {
+              console.log('📨 Parent received message:', event.data?.type || 'unknown');
+              
+              // Verify origin for security
+              if (event.origin !== window.location.origin) {
+                console.warn('⚠ Ignoring message from different origin:', event.origin);
+                return;
+              }
+              
+              if (event.data && event.data.type === 'SIDEDRAWER_OAUTH_TOKENS') {
+                console.log('✅ Received OAuth tokens from popup');
+                console.log('Has access_token:', !!event.data.tokens?.access_token);
+                console.log('Has refresh_token:', !!event.data.tokens?.refresh_token);
+                
+                // Show processing message
+                document.getElementById('app-content').innerHTML = `
+                  <div class="loading">
+                    <div class="spinner"></div>
+                    <p>Saving authentication...</p>
+                  </div>
+                `;
+                
+                try {
+                  // Save the tokens
+                  await this.saveTokens(event.data.tokens);
+                  console.log('✅ Tokens saved successfully');
+                  
+                  // Show connected status
+                  await this.checkConnection();
+                } catch (error) {
+                  console.error('❌ Failed to save tokens:', error);
+                  this.showError(`Failed to save authentication: ${error.message}`);
+                }
+              } else if (event.data && event.data.type === 'SIDEDRAWER_OAUTH_ERROR') {
+                console.error('❌ OAuth error from popup:', event.data.error);
+                this.showError(`Authentication failed: ${event.data.error}`);
+              }
+            });
+
+            // Apply Zoho-hosted config variables (overrides URL params if running inside Zoho CRM)
+            await this.loadZohoConfig();
+
+            // Initialize after Zoho setup (or fallback)
+            console.log('Proceeding with initialization (Zoho initialized:', this.zohoInitialized, ')');
+            console.log('OAuth Redirect URI:', OAUTH_CONFIG.redirectUri);
+            this.init();
+          } catch (error) {
+            console.error('Initialization error:', error);
+          }
+        }
+
+        async loadZohoConfig() {
+          try {
+            // Get widget variables from Zoho CRM
+            const config = await ZOHO.CRM.CONFIG.getVariables();
+            
+            if (config) {
+              console.log('✓ Loaded Zoho widget variables:', Object.keys(config));
+              
+              // Redirect URI (REQUIRED in production)
+              if (config.redirect_uri && config.redirect_uri.trim()) {
+                OAUTH_CONFIG.redirectUri = config.redirect_uri.trim();
+                console.log('✓ Using configured redirect URI:', OAUTH_CONFIG.redirectUri);
+              } else {
+                console.warn('⚠ No redirect URI configured - using auto-detection (may not work behind proxies)');
+                console.log('Current URL:', OAUTH_CONFIG.redirectUri);
+              }
+              
+                // Client ID (can also come from URL params)
+                if (config.client_id && config.client_id.trim()) {
+                  OAUTH_CONFIG.clientId = config.client_id.trim();
+                  usingDefaultClientId = false;
+                  console.log('✓ Client ID loaded from Zoho config');
+                }
+
+              // Realm (REQUIRED for Keycloak — an explicit keycloak_url+realm pair wins outright,
+              // otherwise a named preset). Only applied when this variable exists at all, so an
+              // admin who never fills it in keeps whatever URL param already resolved.
+              if (config.keycloak_url && config.keycloak_url.trim() && config.realm && config.realm.trim()) {
+                const base = config.keycloak_url.trim().replace(/\/$/, '');
+                const realm = config.realm.trim();
+                applyIssuerToConfig(`${base}/realms/${realm}`, realm, 'from Zoho config');
+                OAUTH_CONFIG.env = envForOrigin(new URL(base).origin) || config.environment || OAUTH_CONFIG.env;
+              } else if (config.preset && config.preset.trim()) {
+                applyPresetToConfig(config.preset.trim(), 'from Zoho config');
+              } else {
+                console.warn('⚠ No keycloak_url+realm or preset in Zoho config - keeping current realm');
+              }
+
+              // IdP hint (optional) — passed through to the authorize URL as kc_idp_hint.
+              if (config.idp_hint && config.idp_hint.trim()) {
+                OAUTH_CONFIG.idpHint = config.idp_hint.trim();
+              }
+            } else {
+              console.warn('⚠ No Zoho configuration found - using defaults (development mode)');
+            }
+          } catch (error) {
+            console.warn('⚠ Could not load Zoho config, using defaults (development mode):', error.message);
+          }
+        }
+
+        // Simple localStorage-only session management
+        async setZohoSession(data) {
+          localStorage.setItem(ZOHO_SESSION_KEY, JSON.stringify(data));
+          console.log('✓ Stored session in localStorage (env:', data.env || 'not set', ')');
+          return true;
+        }
+
+        async getZohoSession() {
+          const data = localStorage.getItem(ZOHO_SESSION_KEY);
+          return data ? JSON.parse(data) : null;
+        }
+
+        async clearZohoSession() {
+          localStorage.removeItem(ZOHO_SESSION_KEY);
+          console.log('✓ Cleared session from localStorage');
+        }
+
+        async init() {
+          // Check if we're returning from OAuth redirect
+          const urlParams = new URLSearchParams(window.location.search);
+          const code = urlParams.get('code');
+          const error = urlParams.get('error');
+
+          // Check if we're in a popup window opened for OAuth
+          const isPopup = window.opener && !window.opener.closed;
+
+          if (error) {
+            if (isPopup) {
+              // Close popup and let parent handle error
+              window.close();
+            } else {
+              this.showError(`Authentication error: ${error}`);
+              this.cleanupOAuthState();
+            }
+            return;
+          }
+
+          if (code) {
+            if (isPopup) {
+              // We're in the OAuth popup - exchange code for tokens and pass to parent
+              console.log('🔐 OAuth popup: Received authorization code');
+              console.log('Code:', code.substring(0, 20) + '...');
+              
+              // Show loading in popup
+              document.getElementById('app-content').innerHTML = `
+                <div class="loading">
+                  <div class="spinner"></div>
+                  <p>Completing authentication...</p>
+                  <p class="text-small-gray mt-10">This window will close automatically...</p>
+                </div>
+              `;
+              
+              try {
+                // IMPORTANT: Try state parameter FIRST (most reliable, can't be stale)
+                let codeVerifier = null;
+                const state = urlParams.get('state');
+                console.log('🔍 State parameter from URL:', state ? state.substring(0, 50) + '...' : 'NOT FOUND');
+                
+                if (state) {
+                  try {
+                    const decoded = atob(state);
+                    console.log('🔍 Decoded state:', decoded);
+                    const stateData = JSON.parse(decoded);
+                    console.log('🔍 Parsed state data:', stateData);
+                    codeVerifier = stateData.verifier;
+                    console.log('✅ Code verifier from state parameter:', codeVerifier ? codeVerifier.substring(0, 10) + '...' : 'NOT FOUND');
+
+                    // Recover the issuer (realm) from state so the popup uses the correct token
+                    // endpoint. Only override when state actually carried one — otherwise keep
+                    // whatever this popup's own URL params already resolved to. Required because
+                    // the popup does not reliably inherit sessionStorage from its opener.
+                    if (stateData.issuer) {
+                      applyIssuerToConfig(stateData.issuer, stateData.realm, 'popup, from OAuth state');
+                      if (stateData.env) OAUTH_CONFIG.env = stateData.env;
+                    }
+                    // Must follow applyIssuerToConfig: the issuer switch does not touch clientId,
+                    // and the value set at load time came from the wrong realm's defaults.
+                    if (stateData.clientId) {
+                      OAUTH_CONFIG.clientId = stateData.clientId;
+                      usingDefaultClientId = false;
+                      console.log('✅ Popup: client_id recovered from state:', stateData.clientId);
+                    }
+
+                    // Recover redirectUri from state — popup has separate sessionStorage so
+                    // the parent's redirect_uri must be passed via state to guarantee exact match
+                    if (stateData.redirectUri) {
+                      OAUTH_CONFIG.redirectUri = stateData.redirectUri;
+                      console.log('✅ Popup: redirectUri recovered from state:', stateData.redirectUri);
+                    }
+                  } catch (e) {
+                    console.warn('⚠ Could not parse state parameter:', e);
+                    console.error('State parsing error details:', e.stack);
+                  }
+                }
+                
+                // If redirectUri was not recovered from state (old state format or parse failure),
+                // reconstruct it from the popup's current URL by stripping OAuth callback params
+                if (!OAUTH_CONFIG.redirectUri || OAUTH_CONFIG.redirectUri === (window.location.origin + window.location.pathname)) {
+                  const popupUrl = new URL(window.location.href);
+                  ['code', 'state', 'error', 'error_description'].forEach(p => popupUrl.searchParams.delete(p));
+                  OAUTH_CONFIG.redirectUri = popupUrl.toString();
+                  console.log('✅ Popup: redirectUri reconstructed from popup URL:', OAUTH_CONFIG.redirectUri);
+                }
+
+                // Fallback to localStorage only if state failed
+                if (!codeVerifier) {
+                  codeVerifier = localStorage.getItem(STORAGE_KEYS.codeVerifier);
+                  console.log('Code verifier from localStorage:', codeVerifier ? codeVerifier.substring(0, 10) + '...' : 'NOT FOUND');
+                }
+                
+                // Last resort: sessionStorage
+                if (!codeVerifier) {
+                  codeVerifier = sessionStorage.getItem(STORAGE_KEYS.codeVerifier);
+                  console.log('Code verifier from sessionStorage:', codeVerifier ? codeVerifier.substring(0, 10) + '...' : 'NOT FOUND');
+                }
+                
+                if (!codeVerifier) {
+                  throw new Error('Code verifier not found in localStorage, sessionStorage, or state parameter');
+                }
+                
+                console.log('✓ Code verifier found, exchanging code for tokens...');
+                console.log('Code verifier length:', codeVerifier.length);
+                console.log('Code verifier sample:', codeVerifier.substring(0, 20) + '...' + codeVerifier.substring(codeVerifier.length - 10));
+                console.log('Token endpoint:', OAUTH_CONFIG.tokenEndpoint);
+                console.log('Client ID:', OAUTH_CONFIG.clientId);
+                console.log('Redirect URI:', OAUTH_CONFIG.redirectUri);
+
+                const tokenRequestBody = {
+                  grant_type: 'authorization_code',
+                  client_id: OAUTH_CONFIG.clientId,
+                  code: code,
+                  code_verifier: codeVerifier,
+                  redirect_uri: OAUTH_CONFIG.redirectUri
+                };
+
+                const tokenResponse = await postForm(OAUTH_CONFIG.tokenEndpoint, tokenRequestBody);
+
+                console.log('Token response status:', tokenResponse.status, tokenResponse.statusText);
+
+                if (!tokenResponse.ok) {
+                  const { errorData, message } = await parseTokenErrorResponse(tokenResponse);
+                  console.error('❌ Token exchange error (parsed):', errorData);
+                  throw new Error(message);
+                }
+
+                const tokenData = await tokenResponse.json();
+                console.log('✅ Token exchange successful!');
+                console.log('Has access_token:', !!tokenData.access_token);
+                console.log('Has refresh_token:', !!tokenData.refresh_token);
+                console.log('Expires in:', tokenData.expires_in);
+                
+                // Show success message in popup
+                document.getElementById('app-content').innerHTML = `
+                  <div class="success-message">
+                    ✓ Authentication successful!
+                    <br><small>Closing window...</small>
+                  </div>
+                `;
+                
+                // Send tokens to parent window
+                if (window.opener && !window.opener.closed) {
+                  console.log('Sending tokens to parent window...');
+                  window.opener.postMessage({ 
+                    type: 'SIDEDRAWER_OAUTH_TOKENS',
+                    tokens: tokenData
+                  }, window.location.origin);
+                  console.log('✅ Tokens sent to parent');
+                } else {
+                  console.warn('⚠ Parent window not available');
+                }
+                
+                // Clean up and close
+                localStorage.removeItem(STORAGE_KEYS.codeVerifier);
+                sessionStorage.removeItem(STORAGE_KEYS.codeVerifier);
+                setTimeout(() => {
+                  console.log('Closing popup...');
+                  window.close();
+                }, 1000);
+                
+              } catch (error) {
+                console.error('❌ OAuth popup error:', error);
+                console.error('Error details:', error.stack);
+                
+                // Show error message in popup
+                document.getElementById('app-content').innerHTML = `
+                  <div class="error-message">
+                    ✗ Authentication failed
+                    <br><small>${error.message}</small>
+                    <br><small class="mt-10 block">Check browser console for details. Window will close in 5 seconds...</small>
+                  </div>
+                `;
+                
+                // Send error to parent
+                if (window.opener && !window.opener.closed) {
+                  window.opener.postMessage({ 
+                    type: 'SIDEDRAWER_OAUTH_ERROR',
+                    error: error.message
+                  }, window.location.origin);
+                }
+                setTimeout(() => window.close(), 5000);
+              }
+              return;
+            } else {
+              // Normal flow (not in popup) - handle callback directly
+              await this.handleOAuthCallback(code);
+              return;
+            }
+          }
+
+          // Check existing token
+          const hasSession = await this.checkConnection();
+        }
+
+        async checkConnection() {
+          // Align OAUTH_CONFIG with whatever realm actually issued the stored session's token —
+          // BEFORE reading it. The page's own URL/preset config is only ever a best guess (it
+          // has no `realm` at all in bridge-iframe mode, and even in the login tab it can be
+          // stale after e.g. a tenant migration to a new realm); the stored token's issuer is
+          // ground truth. A no-op when there is no stored session yet.
+          syncConfigFromStoredSession();
+
+          // Try to get existing session
+          const session = await this.getZohoSession();
+          const refreshToken = await this.getRefreshToken();
+          
+          // Check if session exists and token is valid
+          if (session && session.accessToken && !this.isTokenExpired(session.expiresAt, session.expiresIn)) {
+            // Valid session exists - check if tenant exists
+            console.log('✓ Valid session found');
+            const hasTenant = await this.checkTenantExists();
+            if (!hasTenant) {
+              // No tenant - show connected status with "Create new tenant" button instead of auto-showing wizard
+              this.showConnectedStatus(); // Will include the button
+              return false;
+            }
+            this.showConnectedStatus();
+            return true;
+          } else if (session && session.accessToken && this.isTokenExpired(session.expiresAt, session.expiresIn)) {
+            // Session exists but token is EXPIRED
+            // DON'T refresh immediately on page load (F5) - let ensureValidSession() handle it when needed
+            // This prevents wasting silver bullets with invalid refresh tokens
+            console.log('⚠️ Expired session detected on page load');
+            console.log('  Expires at:', session.expiresAt ? new Date(parseInt(session.expiresAt)).toISOString() : 'N/A');
+            console.log('  Current time:', new Date().toISOString());
+            console.log('  Refresh token available:', refreshToken ? 'YES' : 'NO');
+            console.log('  Session keys:', session ? Object.keys(session) : []);
+            console.log('  Note: Refresh will happen automatically when needed via ensureValidSession()');
+            
+            if (refreshToken) {
+              // Show connected status - refresh will happen when API calls are made
+              this.showConnectedStatus();
+              return true;
+            } else {
+              console.warn('⚠️ Expired session found but no refresh token available');
+              console.warn('⚠️ This session was created before refresh token storage was added');
+              console.warn('⚠️ You need to re-authenticate to get a refresh token');
+              
+              // Show helpful error message
+              document.getElementById('app-content').innerHTML = `
+                <div class="status-card error">
+                  <div class="status-indicator">
+                    <div class="status-dot error"></div>
+                    <span class="status-text">Session Expired - Re-authentication Required</span>
+                  </div>
+                  <p class="status-info-text">
+                    Your session expired and cannot be refreshed automatically because it was created before refresh token storage was implemented.
+                  </p>
+                  <p class="status-info-text">
+                    Please click "Connect to SideDrawer" below to re-authenticate. Your new session will include refresh token support.
+                  </p>
+                </div>
+                <button class="btn btn-success mt-20" onclick="auth.startOAuthFlow()">Connect to SideDrawer</button>
+              `;
+            }
+          } else if (refreshToken) {
+            // No session but have refresh token - try silent refresh
+            console.log('🔄 No session found, but refresh token exists - attempting refresh...');
+            document.getElementById('app-content').innerHTML = `
+              <div class="loading">
+                <div class="spinner"></div>
+                <p>Refreshing connection...</p>
+              </div>
+            `;
+            await this.refreshAccessToken();
+          } else {
+            // No valid session or refresh token
+            console.log('⚠️ No session or refresh token found');
+            
+            // Show disconnected status with "Create new tenant" button
+            this.showDisconnectedStatus();
+            return false;
+          }
+        }
+
+        startPeriodicTokenRefresh() {
+          // REMOVED: Periodic refresh wastes silver bullets
+          // Token refresh is now handled reactively by ensureValidSession() when actually needed
+          // This prevents unnecessary refresh attempts that waste refresh tokens
+        }
+
+        async showConnectedStatus() {
+          // Periodic refresh removed - refresh happens reactively when needed via ensureValidSession()
+          
+          const session = await this.getZohoSession();
+          const expiryDate = session ? new Date(parseInt(session.expiresAt)) : new Date();
+          const hasRefreshToken = !!(await this.getRefreshToken());
+          
+          document.getElementById('app-content').innerHTML = `
+            <div class="status-card connected">
+              <div class="status-indicator">
+                <div class="status-dot connected"></div>
+                <span class="status-text">Connected to SideDrawer</span>
+              </div>
+              <p class="status-info-text">Your integration is active and ready to use.</p>
+            </div>
+
+            <div class="status-info-box">
+              <p class="status-info-item"><strong class="status-info-label">Status:</strong> Authenticated</p>
+              <p class="status-info-item"><strong class="status-info-label">Storage:</strong> ${this.zohoInitialized ? 'Zoho Session (shared across widgets)' : 'localStorage (fallback)'}</p>
+              <p class="status-info-item"><strong class="status-info-label">Token Expires:</strong> ${expiryDate.toLocaleString()}</p>
+              <p class="status-info-item"><strong class="status-info-label">Silent Refresh:</strong> ${hasRefreshToken ? 'Enabled' : 'Disabled'}</p>
+            </div>
+
+            <div class="button-group">
+              <button class="btn" onclick="auth.disconnect()">Disconnect</button>
+              <button class="btn btn-success" onclick="auth.testConnection()">Test Connection</button>
+              ${getTenantCreationButtonHtml('btn btn-primary')}
+            </div>
+
+            <div id="test-result"></div>
+          `;
+        }
+
+        showDisconnectedStatus() {
+          document.getElementById('app-content').innerHTML = `
+            <div class="status-card">
+              <div class="status-indicator">
+                <div class="status-dot"></div>
+                <span class="status-text">Not Connected</span>
+              </div>
+              <p class="text-muted-sm">Connect your SideDrawer account to enable the integration.</p>
+            </div>
+
+            <div class="info-section">
+              <p><strong>What is SideDrawer?</strong></p>
+              <p>SideDrawer is a secure document storage and sharing platform designed for financial advisors and their clients.</p>
+              <br>
+              <p><strong>This integration allows you to:</strong></p>
+              <ul class="list-item-spaced">
+                <li>Access SideDrawer documents directly</li>
+                <li>Share content with clients through SideDrawer</li>
+                <li>Manage client documents securely</li>
+              </ul>
+            </div>
+
+            <button class="btn btn-success" onclick="auth.startOAuthFlow()">Connect to SideDrawer</button>
+            ${getTenantCreationButtonHtml('btn btn-outline mt-10')}
+          `;
+        }
+
+        showError(message, showDisconnect = false) {
+          const disconnectButton = showDisconnect ? `
+            <button class="btn" onclick="auth.disconnect()" style="background: #dc3545; margin-left: 10px;">
+              Disconnect & Re-authenticate
+            </button>
+          ` : '';
+          
+          document.getElementById('app-content').innerHTML = `
+            <div class="status-card error">
+              <div class="status-indicator">
+                <div class="status-dot error"></div>
+                <span class="status-text">Connection Error</span>
+              </div>
+              <div class="error-message">
+                ${message}
+              </div>
+            </div>
+
+            <button class="btn" onclick="auth.checkConnection()">Try Again</button>
+            ${disconnectButton}
+          `;
+        }
+
+        async checkTenantExists() {
+          try {
+            const token = await this.getAccessToken();
+            if (!token) return false;
+
+            const tenantApi = window.sdHosts().tenants + '/api/v1/tenants/tenant/shared';
+
+            const response = await fetch(tenantApi, {
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json'
+              }
+            });
+
+            if (response.ok) {
+              const tenants = await response.json();
+              return tenants && tenants.length > 0;
+            }
+            return false;
+          } catch (error) {
+            console.error('❌ Error checking tenant:', error);
+            return false;
+          }
+        }
+
+        async showTenantCreationFlow() {
+          const session = await this.getZohoSession();
+          const token = await this.getAccessToken();
+          
+          // Ensure tenant-wizard container exists
+          let wizardContainer = document.getElementById('tenant-wizard');
+          if (!wizardContainer) {
+            wizardContainer = document.createElement('div');
+            wizardContainer.id = 'tenant-wizard';
+            wizardContainer.style.display = 'none';
+            const container = document.querySelector('.container');
+            if (container) {
+              container.appendChild(wizardContainer);
+            } else {
+              document.body.appendChild(wizardContainer);
+            }
+          }
+          
+          // Hide main content
+          const appContent = document.getElementById('app-content');
+          if (appContent) {
+            appContent.style.display = 'none';
+          }
+          
+          // Determine which wizard to use based on auth state
+          if (session && token) {
+            // Logged-in user - use credentials wizard
+            let attempts = 0;
+            const maxAttempts = 50;
+            
+            while (attempts < maxAttempts) {
+              if (typeof window.tenantWizardWithCredentials !== 'undefined' && window.tenantWizardWithCredentials) {
+                try {
+                  await window.tenantWizardWithCredentials.init(token);
+                  return;
+                } catch (error) {
+                  const dict = window.tenantWizardWithCredentials?.state?.dictionary || {};
+                  this.showError(dict.globalparams_error || 'Failed to initialize tenant creation wizard: ' + error.message);
+                  return;
+                }
+              }
+              await new Promise(resolve => setTimeout(resolve, 100));
+              attempts++;
+            }
+            
+            this.showError('Tenant creation wizard for logged-in users is not available. Please refresh the page.');
+          } else {
+            // Non-logged-in user - use existing wizard
+            let attempts = 0;
+            const maxAttempts = 50;
+            
+            while (attempts < maxAttempts) {
+              if (typeof window.tenantWizard !== 'undefined' && window.tenantWizard) {
+                try {
+                  await window.tenantWizard.init();
+                  return;
+                } catch (error) {
+                  const dict = window.tenantWizard?.state?.dictionary || {};
+                  this.showError(dict.globalparams_error || 'Failed to initialize tenant creation wizard: ' + error.message);
+                  return;
+                }
+              }
+              await new Promise(resolve => setTimeout(resolve, 100));
+              attempts++;
+            }
+            
+            this.showError('Tenant creation wizard is not available. Please refresh the page.');
+          }
+        }
+
+        async startOAuthFlow() {
+          try {
+            // Validate configuration
+            if (!OAUTH_CONFIG.clientId) {
+              // If no OAuth config, show tenant creation flow directly
+              await this.showTenantCreationFlow();
+              return;
+            }
+            
+            // Generate PKCE code verifier and challenge
+            const codeVerifier = this.generateCodeVerifier();
+            const codeChallenge = await this.generateCodeChallenge(codeVerifier);
+
+            // Store code verifier in BOTH localStorage and sessionStorage for redundancy
+            localStorage.setItem(STORAGE_KEYS.codeVerifier, codeVerifier);
+            sessionStorage.setItem(STORAGE_KEYS.codeVerifier, codeVerifier);
+            console.log('✓ Code verifier stored:', codeVerifier.substring(0, 10) + '...');
+            console.log('✓ Code verifier length:', codeVerifier.length);
+
+            // Build authorization URL with state containing code verifier + issuer/realm/env +
+            // redirectUri for popup recovery.
+            const stateObj = {
+              random: this.generateRandomString(16),
+              verifier: codeVerifier,
+              issuer: OAUTH_CONFIG.issuer,
+              realm: OAUTH_CONFIG.realm,
+              env: OAUTH_CONFIG.env,
+              redirectUri: OAUTH_CONFIG.redirectUri,
+              // The callback URL carries only ?code&state, and the popup does not reliably
+              // inherit sessionStorage — so without this, the popup would fall back to the
+              // 'local' preset and POST the code to the WRONG realm's token endpoint. Keycloak
+              // answers 400 invalid_grant with no CORS header, which surfaces in the browser as
+              // a misleading "blocked by CORS policy" error.
+              clientId: OAUTH_CONFIG.clientId
+            };
+            const state = JSON.stringify(stateObj);
+            const encodedState = btoa(state);
+
+            const authUrl = new URL(OAUTH_CONFIG.authorizationEndpoint);
+            authUrl.searchParams.append('response_type', 'code');
+            authUrl.searchParams.append('client_id', OAUTH_CONFIG.clientId);
+            authUrl.searchParams.append('redirect_uri', OAUTH_CONFIG.redirectUri);
+            authUrl.searchParams.append('scope', OAUTH_CONFIG.scope);
+            if (OAUTH_CONFIG.idpHint) {
+              authUrl.searchParams.append('kc_idp_hint', OAUTH_CONFIG.idpHint);
+            }
+            authUrl.searchParams.append('code_challenge', codeChallenge);
+            authUrl.searchParams.append('code_challenge_method', 'S256');
+            authUrl.searchParams.append('state', encodedState);
+
+            // Check if we're running inside an iframe (Zoho)
+            const isInIframe = window.self !== window.top;
+
+            if (isInIframe) {
+              // Open popup window for OAuth (works in Zoho iframe)
+              const width = 600;
+              const height = 700;
+              const left = (screen.width - width) / 2;
+              const top = (screen.height - height) / 2;
+              
+              const popupUrl = authUrl.toString();
+              
+              const popup = window.open(
+                popupUrl,
+                'SideDrawer OAuth',
+                `width=${width},height=${height},left=${left},top=${top},resizable=yes,scrollbars=yes`
+              );
+
+              if (!popup) {
+                throw new Error('Popup blocked! Please allow popups for this site and try again.');
+              }
+
+              // Show waiting status
+              document.getElementById('app-content').innerHTML = `
+                <div class="status-card">
+                  <div class="status-indicator">
+                    <div class="status-dot"></div>
+                    <span class="status-text">Authenticating...</span>
+                  </div>
+                  <p class="auth-info-text">Please complete the login in the popup window.</p>
+                  <p class="auth-info-text-small">
+                    Don't see the popup? Check if your browser blocked it and allow popups for this site.
+                  </p>
+                </div>
+              `;
+
+              // Poll for popup close or callback
+              const pollInterval = setInterval(() => {
+                if (popup.closed) {
+                  clearInterval(pollInterval);
+                  console.log('Popup closed - checking for auth completion');
+                  // Check if we got redirected back with a code
+                  setTimeout(() => this.checkConnection(), 500);
+                }
+              }, 500);
+
+            } else {
+              console.log('Not in iframe - using direct redirect');
+              // Not in iframe (localhost testing) - use direct redirect
+              window.location.href = authUrl.toString();
+            }
+
+          } catch (error) {
+            console.error('OAuth flow error:', error);
+            this.showError(`Failed to start authentication: ${error.message}`);
+          }
+        }
+
+        async handleOAuthCallback(code) {
+          document.getElementById('app-content').innerHTML = `
+            <div class="loading">
+              <div class="spinner"></div>
+              <p>Completing authentication...</p>
+            </div>
+          `;
+
+          try {
+            // Try state parameter FIRST (can't be lost to storage clearing/partitioning),
+            // same recovery approach as the popup flow — the state also carries the exact
+            // redirect_uri/issuer/realm used at authorize time, since OAUTH_CONFIG may have
+            // been recomputed differently on this fresh page load (e.g. default vs explicit
+            // client_id).
+            let codeVerifier = null;
+            const state = urlParams.get('state');
+            if (state) {
+              try {
+                const stateData = JSON.parse(atob(state));
+                codeVerifier = stateData.verifier || null;
+                if (stateData.issuer) {
+                  applyIssuerToConfig(stateData.issuer, stateData.realm, 'callback, from OAuth state');
+                  if (stateData.env) OAUTH_CONFIG.env = stateData.env;
+                }
+                if (stateData.clientId) {
+                  OAUTH_CONFIG.clientId = stateData.clientId;
+                  usingDefaultClientId = false;
+                }
+                if (stateData.redirectUri) {
+                  OAUTH_CONFIG.redirectUri = stateData.redirectUri;
+                }
+              } catch (e) {
+                console.warn('⚠ Could not parse state parameter:', e);
+              }
+            }
+
+            // Fallback to localStorage/sessionStorage only if state parsing failed
+            if (!codeVerifier) {
+              codeVerifier = localStorage.getItem(STORAGE_KEYS.codeVerifier);
+            }
+            if (!codeVerifier) {
+              codeVerifier = sessionStorage.getItem(STORAGE_KEYS.codeVerifier);
+            }
+
+            if (!codeVerifier) {
+              throw new Error('Code verifier not found. Please try again.');
+            }
+
+            // Exchange code for token (PKCE - no client_secret)
+            const tokenRequestBody = {
+              grant_type: 'authorization_code',
+              client_id: OAUTH_CONFIG.clientId,
+              code: code,
+              code_verifier: codeVerifier,
+              redirect_uri: OAUTH_CONFIG.redirectUri
+            };
+
+            const tokenResponse = await postForm(OAUTH_CONFIG.tokenEndpoint, tokenRequestBody);
+
+            if (!tokenResponse.ok) {
+              const { message } = await parseTokenErrorResponse(tokenResponse);
+              throw new Error(message);
+            }
+
+            const tokenData = await tokenResponse.json();
+            
+            // Store tokens
+            this.saveTokens(tokenData);
+            this.cleanupOAuthState();
+
+            // Clear URL parameters
+            window.history.replaceState({}, document.title, window.location.pathname);
+
+            // Show success
+            document.getElementById('app-content').innerHTML = `
+              <div class="success-message">
+                ✓ Successfully connected to SideDrawer!
+              </div>
+            `;
+
+            // Reload to show connected status
+            setTimeout(() => this.checkConnection(), 1500);
+
+          } catch (error) {
+            console.error('Token exchange error:', error);
+            this.showError(`Authentication failed: ${error.message}`);
+            this.cleanupOAuthState();
+          }
+        }
+
+        /**
+         * Refresh the access token.
+         *
+         * Keycloak's "Revoke Refresh Token" (rotation) setting is OFF by default, unlike the
+         * Auth0 tenant this widget used to target — so the specific race this locking exists
+         * for may not be reachable on a default realm. It stays anyway, for three reasons: (1)
+         * it is a single realm-level checkbox, and the day someone flips it on, removing this
+         * code becomes an intermittent, cross-tab, very expensive-to-diagnose outage; (2) even
+         * without rotation, two concurrent refreshes still race to overwrite `sdSession` in
+         * localStorage, and the loser's stale write can clobber the winner's newer token; (3)
+         * with `offline_access` (this widget's scope — see OAUTH_CONFIG), every refresh is a
+         * database write to Keycloak's offline-session store, so serializing it is a real load
+         * reduction, not just a correctness nicety. Two layers, for two kinds of concurrent
+         * caller:
+         *
+         * 1. SINGLE-FLIGHT (same page). Three call sites in THIS script can fire concurrently
+         *    (page-load expiry check, ensureValidSession, testConnection). Concurrent callers
+         *    await the same in-flight promise instead of starting their own exchange.
+         *
+         * 2. CROSS-TAB LOCK (different pages). `sdSession` lives in localStorage, which is
+         *    shared by every tab/frame on this origin — including the hidden bridge iframe a
+         *    Zoho CRM tab keeps open. The single-flight guard above is a plain JS variable and
+         *    is invisible to those other contexts, so two tabs can each read the same refresh
+         *    token and both start refreshing at once. If rotation IS enabled on the realm, the
+         *    loser POSTs a token the winner has already rotated away, and Keycloak answers 400
+         *    invalid_grant "Invalid refresh token" — even though nothing on this page did
+         *    anything wrong. `navigator.locks` serializes the actual exchange across every tab
+         *    on this origin; `_doRefreshAccessToken` re-reads the refresh token from storage at
+         *    its own start, so a caller that waited for the lock picks up whatever the winner
+         *    just rotated to.
+         */
+        async refreshAccessToken() {
+          if (this._refreshInFlight) {
+            console.log('⏳ Refresh already in flight on this page — awaiting the existing request');
+            return this._refreshInFlight;
+          }
+          const runLocked = () => {
+            if (typeof navigator !== 'undefined' && navigator.locks && navigator.locks.request) {
+              return navigator.locks.request('sidedrawer_token_refresh', () => this._doRefreshAccessToken());
+            }
+            // No Web Locks API available — fall back to same-page-only protection.
+            return this._doRefreshAccessToken();
+          };
+          this._refreshInFlight = runLocked()
+            .finally(() => { this._refreshInFlight = null; });
+          return this._refreshInFlight;
+        }
+
+        async _doRefreshAccessToken() {
+          // getRefreshToken() already checks the session object before falling back to the
+          // legacy localStorage key (see below), so one code path covers what used to be two
+          // duplicated branches here.
+          const refreshToken = await this.getRefreshToken();
+
+          if (!refreshToken) {
+            console.error('❌ No refresh token available for refresh');
+            this.showDisconnectedStatus();
+            return;
+          }
+
+          try {
+            console.log('🔄 Refreshing access token...');
+            console.log('  Token endpoint:', OAUTH_CONFIG.tokenEndpoint);
+            console.log('  Client ID:', OAUTH_CONFIG.clientId);
+            console.log('  Refresh token:', refreshToken.substring(0, 20) + '...');
+
+            // No `audience` (Keycloak has none) and no `scope` — Keycloak requires the refresh
+            // scope to be a subset of the original grant, so omitting it reuses that grant
+            // instead of risking invalid_scope if this constant ever drifts from what the user
+            // actually authorized weeks or months ago.
+            const refreshRequestBody = {
+              grant_type: 'refresh_token',
+              client_id: OAUTH_CONFIG.clientId,
+              refresh_token: refreshToken
+            };
+
+            const response = await postForm(OAUTH_CONFIG.tokenEndpoint, refreshRequestBody);
+
+            if (!response.ok) {
+              const { errorData, message } = await parseTokenErrorResponse(response);
+              console.error('❌ Token refresh failed:', response.status, errorData);
+
+              // A terminal invalid_grant means THIS refresh token is dead (SSO/offline session
+              // idle-or-max exceeded, or the token was already consumed) — no retry will fix it.
+              // Clear it so the sibling widget's auto-refresh trigger (which re-fires on every
+              // expired-session response, gated only by a short cooldown) takes its "no refresh
+              // token → user must re-authenticate" branch instead of polling this endpoint
+              // indefinitely.
+              if (errorData && errorData.error === 'invalid_grant') {
+                await this.clearStoredRefreshToken();
+              }
+
+              throw new Error(message);
+            }
+
+            const tokenData = await response.json();
+            console.log('✅ Token refresh successful!');
+            console.log('  New access token length:', tokenData.access_token?.length || 0);
+            console.log('  Expires in:', tokenData.expires_in, 'seconds');
+            console.log('  New refresh token provided:', !!tokenData.refresh_token);
+            if (tokenData.refresh_token) {
+              // Keycloak always issues a fresh refresh token on this grant, unlike Auth0 where
+              // this signalled rotation being specifically enabled.
+              console.log('  🔄 New refresh token received');
+            }
+
+            this.saveTokens(tokenData);
+            this.showConnectedStatus();
+
+          } catch (error) {
+            console.error('❌ Token refresh error:', error);
+            console.error('Error details:', error.stack);
+            // Show disconnect option since refresh token is likely invalid
+            this.showError(`Failed to refresh session: ${error.message}`, true);
+            // Re-throw so callers (e.g. REFRESH_SIDEDRAWER_TOKEN handler) know the refresh failed
+            // and don't silently return the old expired session as if it were refreshed.
+            throw error;
+          }
+        }
+
+        async testConnection() {
+          const resultDiv = document.getElementById('test-result');
+          resultDiv.innerHTML = `
+            <div class="loading loading-padded">
+              <div class="spinner"></div>
+              <p>Testing connection...</p>
+            </div>
+          `;
+
+          try {
+            // Auto-refresh if session is expired before testing
+            const session = await this.getZohoSession();
+            if (session && this.isTokenExpired(session.expiresAt, session.expiresIn)) {
+              const refreshToken = await this.getRefreshToken();
+              if (refreshToken) {
+                await this.refreshAccessToken();
+              }
+            }
+            const token = await this.getAccessToken();
+            
+            // Test API call to SideDrawer tenant endpoint
+            const tenantApi = window.sdHosts().tenants + '/api/v1/tenants/tenant/shared';
+            const response = await fetch(tenantApi, {
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json'
+              }
+            });
+
+            if (response.ok) {
+              const data = await response.json();
+              
+              if (data && data.length > 0) {
+                const tenant = data[0];
+                const tenantInfo = { 
+                  tenantId: tenant.id || "", 
+                  brandCode: tenant.defaultBrandCode || "", 
+                  region: tenant.region || "" 
+                };
+                
+                resultDiv.innerHTML = `
+                  <div class="success-message">
+                    ✓ Connection test successful!
+                  </div>
+                  <div class="info-section info-section-spaced">
+                    <strong class="info-section-title">Tenant Information:</strong>
+                    <p><strong>Tenant ID:</strong> ${tenantInfo.tenantId}</p>
+                    <p><strong>Brand Code:</strong> ${tenantInfo.brandCode}</p>
+                    <p><strong>Region:</strong> ${tenantInfo.region}</p>
+                  </div>
+                  <div class="token-info token-info-spaced">
+                    <strong class="token-info-title">Access Token:</strong>
+                    <code class="code-block">${token}</code>
+                    <button class="btn btn-small" onclick="navigator.clipboard.writeText('${token}').then(() => alert('Token copied to clipboard!'))">📋 Copy Token</button>
+                  </div>
+                `;
+              } else {
+                throw new Error('No tenant data returned');
+              }
+            } else {
+              const errorText = await response.text().catch(() => '');
+              throw new Error(`API returned ${response.status}: ${errorText}`);
+            }
+
+          } catch (error) {
+            console.error('Connection test error:', error);
+            resultDiv.innerHTML = `
+              <div class="error-message">
+                ✗ Connection test failed: ${error.message}
+              </div>
+            `;
+          }
+        }
+
+        async disconnect() {
+          console.log('🔓 Disconnecting from SideDrawer...');
+
+          // Clear periodic refresh interval
+          if (this.refreshInterval) {
+            clearInterval(this.refreshInterval);
+            this.refreshInterval = null;
+            console.log('✓ Periodic refresh stopped');
+          }
+
+          // Revoke the refresh token BEFORE clearing local state and redirecting. This widget
+          // requests offline_access (see OAUTH_CONFIG.scope), and Keycloak's SSO logout below
+          // does NOT invalidate an offline-session refresh token — only an explicit revoke
+          // does. Skipping this leaves a live, DB-persisted refresh token that any stale copy
+          // of sdSession (another tab, another device) can keep using for up to
+          // offlineSessionIdleTimeout (30 days in the reference realm config).
+          const session = await this.getZohoSession();
+          const refreshTokenToRevoke = session?.refreshToken || localStorage.getItem(STORAGE_KEYS.refreshToken);
+          const idTokenForLogout = session?.idToken || null;
+          if (refreshTokenToRevoke && OAUTH_CONFIG.revokeEndpoint) {
+            try {
+              await postForm(OAUTH_CONFIG.revokeEndpoint, {
+                client_id: OAUTH_CONFIG.clientId,
+                token: refreshTokenToRevoke,
+                token_type_hint: 'refresh_token'
+              });
+              console.log('✓ Refresh token revoked');
+            } catch (e) {
+              console.warn('⚠ Could not revoke refresh token (continuing with logout anyway):', e.message);
+            }
+          }
+
+          // Clear Zoho session
+          await this.clearZohoSession();
+
+          // Clear refresh token from localStorage
+          localStorage.removeItem(STORAGE_KEYS.refreshToken);
+
+          // Keycloak's session cookies (KEYCLOAK_IDENTITY, KEYCLOAK_SESSION, AUTH_SESSION_ID)
+          // are HttpOnly on the Keycloak origin and unreachable from this page's JS — the
+          // logout redirect below is what actually ends the server-side session. This sweep
+          // only clears same-origin, JS-visible state.
+          this.clearAllCookies();
+
+          // Clear all localStorage items related to SideDrawer and Keycloak
+          Object.keys(localStorage).forEach(key => {
+            if (key.includes('sidedrawer') || key.includes('kc') || key.includes('keycloak') || key.includes('@@') || key.includes('_legacy')) {
+              localStorage.removeItem(key);
+            }
+          });
+
+          console.log('✓ Local session cleared');
+
+          // RP-initiated logout. Use id_token_hint (NOT client_id alone) — with client_id alone
+          // Keycloak renders a "Do you want to log out?" confirmation page, which breaks this
+          // plain window.location.href navigation (there is no user to click through it).
+          // Falls back to client_id if no id_token was ever persisted (e.g. a session that
+          // predates this field) and accepts the confirmation page in that case.
+          const issuer = getIssuer();
+          const logoutParams = idTokenForLogout
+            ? `id_token_hint=${encodeURIComponent(idTokenForLogout)}`
+            : `client_id=${encodeURIComponent(OAUTH_CONFIG.clientId)}`;
+          const logoutUrl = `${issuer}/protocol/openid-connect/logout`
+            + `?${logoutParams}`
+            + `&post_logout_redirect_uri=${encodeURIComponent(OAUTH_CONFIG.redirectUri)}`;
+
+          console.log('✓ Redirecting to Keycloak logout:', issuer);
+
+          window.location.href = logoutUrl;
+        }
+
+        clearAllCookies() {
+          // Get all cookies
+          const cookies = document.cookie.split(';');
+          
+          // Clear each cookie by setting expiry to past date
+          for (let i = 0; i < cookies.length; i++) {
+            const cookie = cookies[i];
+            const eqPos = cookie.indexOf('=');
+            const name = eqPos > -1 ? cookie.substr(0, eqPos).trim() : cookie.trim();
+            
+            // Clear for current path and domain
+            document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/';
+            document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=' + window.location.hostname;
+            
+            // Try to clear for parent domain (e.g., .sidedrawer.com)
+            const domainParts = window.location.hostname.split('.');
+            if (domainParts.length > 1) {
+              const parentDomain = '.' + domainParts.slice(-2).join('.');
+              document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=' + parentDomain;
+            }
+            
+            console.log('🗑️ Cleared cookie:', name);
+          }
+        }
+
+        async saveTokens(tokenData) {
+          // Store access token in Zoho session (shared across widgets)
+          const expiresAt = Date.now() + (tokenData.expires_in * 1000);
+          
+          // DEBUG: Log what we received from OAuth
+          console.log('💾 Saving tokens - OAuth response contains:');
+          console.log('  - access_token:', !!tokenData.access_token, tokenData.access_token ? `(${tokenData.access_token.length} chars)` : 'MISSING');
+          console.log('  - refresh_token:', !!tokenData.refresh_token, tokenData.refresh_token ? `(${tokenData.refresh_token.length} chars)` : 'MISSING');
+          console.log('  - expires_in:', tokenData.expires_in);
+          console.log('  - token_type:', tokenData.token_type);
+          console.log('  - All keys in tokenData:', Object.keys(tokenData));
+          
+          // Get existing refresh token (in case new one not provided)
+          // Check both session object and localStorage
+          const session = await this.getZohoSession();
+          const existingRefreshToken = session?.refreshToken || localStorage.getItem(STORAGE_KEYS.refreshToken);
+          
+          console.log('💾 Existing refresh token check:');
+          console.log('  - In session object:', !!session?.refreshToken);
+          console.log('  - In localStorage:', !!localStorage.getItem(STORAGE_KEYS.refreshToken));
+          
+          // Use new refresh token if provided, otherwise keep existing one
+          const refreshTokenToUse = tokenData.refresh_token || existingRefreshToken;
+
+          // Keep the previous id_token if this grant didn't return one (Keycloak's refresh
+          // grant does return a fresh id_token as long as the `openid` scope is present, so
+          // this is a safety net, not the common case).
+          const idTokenToUse = tokenData.id_token || session?.idToken || null;
+
+          // Detect env from the new access token JWT so SidedrawerRelated can sync ENVIRONMENT.
+          // detectEnvFromJWT is authoritative — never trust the widget's own configured env
+          // inside a bridge iframe, whose URL may have been built against the wrong realm.
+          const parsedIssuer = parseIssuer(tokenData.access_token);
+          const tokenEnv = detectEnvFromJWT(tokenData.access_token) || OAUTH_CONFIG.env;
+
+          // refresh_expires_in is 0 for an offline-session refresh token (offline_access scope),
+          // meaning "does not expire" on its own timeline — treat 0 as Infinity rather than as
+          // an instantly-dead token.
+          const refreshExpiresAt = (typeof tokenData.refresh_expires_in === 'number')
+            ? (tokenData.refresh_expires_in > 0 ? Date.now() + (tokenData.refresh_expires_in * 1000) : Infinity)
+            : (session?.refreshExpiresAt ?? null);
+
+          const sessionData = {
+            accessToken: tokenData.access_token,
+            expiresAt: expiresAt,
+            tokenType: tokenData.token_type || 'Bearer',
+            // Store refresh token in session object too (for consistency with @SidedrawerRelated)
+            refreshToken: refreshTokenToUse || null,
+            // Persist clientId so it survives across token refreshes without needing URL params
+            clientId: OAUTH_CONFIG.clientId || null,
+            // env lets SidedrawerRelated sync its ENVIRONMENT without relying on Zoho config vars —
+            // this is one of the six fields the sibling widget's contract requires unchanged.
+            env: tokenEnv,
+            // Everything below is additive to the sdSession contract — SidedrawerRelated only
+            // reads the six fields above and re-serializes the rest untouched.
+            idToken: idTokenToUse,
+            expiresIn: tokenData.expires_in || null,
+            refreshExpiresAt: refreshExpiresAt,
+            // issuer is what lets this widget's own bridge-iframe mode (see
+            // syncConfigFromStoredSession) recover the realm on refresh with no `realm` in the
+            // iframe URL. realm is stored alongside for convenience/debugging.
+            issuer: (parsedIssuer && parsedIssuer.issuer) || OAUTH_CONFIG.issuer || null,
+            realm: (parsedIssuer && parsedIssuer.realm) || OAUTH_CONFIG.realm || null
+          };
+          
+          console.log('💾 Saving session data...');
+          console.log('  Access token length:', tokenData.access_token?.length || 0);
+          console.log('  Expires at:', new Date(expiresAt).toISOString());
+          console.log('  Refresh token in session:', !!sessionData.refreshToken);
+          if (sessionData.refreshToken) {
+            console.log('  Refresh token preview:', sessionData.refreshToken.substring(0, 20) + '...');
+          }
+          
+          await this.setZohoSession(sessionData);
+          
+          // Store refresh token in localStorage (persistent) - ALWAYS save if we have one
+          if (refreshTokenToUse) {
+            localStorage.setItem(STORAGE_KEYS.refreshToken, refreshTokenToUse);
+            console.log('✅ Refresh token stored in localStorage:', STORAGE_KEYS.refreshToken);
+            console.log('✅ Refresh token also stored in session object');
+          } else {
+            console.error('❌ CRITICAL: No refresh token available to store!');
+            console.error('  - OAuth response had refresh_token:', !!tokenData.refresh_token);
+            console.error('  - Existing refresh token found:', !!existingRefreshToken);
+            console.error('  - This means session cannot be refreshed automatically!');
+            console.error('  - User will need to re-authenticate when token expires.');
+          }
+        }
+
+        async getAccessToken() {
+          const session = await this.getZohoSession();
+          return session ? session.accessToken : null;
+        }
+
+        async getRefreshToken() {
+          // PRIORITY 1: Check session object (new format - refresh token stored in session)
+          const session = await this.getZohoSession();
+          console.log('[getRefreshToken] Checking session object:', {
+            hasSession: !!session,
+            hasRefreshToken: !!(session?.refreshToken),
+            sessionKeys: session ? Object.keys(session) : []
+          });
+          
+          if (session && session.refreshToken) {
+            console.log('✅ Refresh token found in session object');
+            return session.refreshToken;
+          }
+          
+          // PRIORITY 2: Check legacy localStorage location (for backward compatibility)
+          const legacyToken = localStorage.getItem(STORAGE_KEYS.refreshToken);
+          console.log('[getRefreshToken] Checking legacy localStorage:', {
+            key: STORAGE_KEYS.refreshToken,
+            found: !!legacyToken
+          });
+          
+          if (legacyToken) {
+            console.log('✅ Refresh token found in legacy localStorage');
+            return legacyToken;
+          }
+          
+          // PRIORITY 3: Check all localStorage keys containing "refresh" or "token"
+          console.log('[getRefreshToken] Scanning localStorage for refresh tokens...');
+          const allKeys = Object.keys(localStorage);
+          const tokenKeys = allKeys.filter(k => k.toLowerCase().includes('refresh') || k.toLowerCase().includes('token'));
+          console.log('[getRefreshToken] Found potential token keys:', tokenKeys);
+          tokenKeys.forEach(key => {
+            const value = localStorage.getItem(key);
+            console.log(`  - ${key}: ${value ? value.substring(0, 20) + '...' : 'empty'}`);
+          });
+          
+          console.log('⚠️ No refresh token found in session object or localStorage');
+          return null;
+        }
+
+        /**
+         * Drop a dead refresh token from both storage locations without touching the rest of
+         * the session (accessToken stays — it may still be valid for a few more minutes).
+         * Called only on a terminal invalid_grant from the token endpoint (see
+         * _doRefreshAccessToken) — see that method for why leaving a dead token in place is
+         * actively harmful to the bridge iframe's auto-refresh loop.
+         */
+        async clearStoredRefreshToken() {
+          try {
+            const session = await this.getZohoSession();
+            if (session && session.refreshToken) {
+              session.refreshToken = null;
+              await this.setZohoSession(session);
+            }
+          } catch (e) {
+            console.warn('[SideDrawer Widget] Could not clear refreshToken from session:', e.message);
+          }
+          localStorage.removeItem(STORAGE_KEYS.refreshToken);
+        }
+
+        /**
+         * `expiresInSeconds` is the token's own lifespan (Keycloak realms are commonly
+         * configured with a 300s default `accessTokenLifespan`), NOT a fixed assumption. A flat
+         * 5-minute buffer against a 300s-lifespan token means every token is "expired" the
+         * instant it is issued, causing a refresh on every call. Capping the buffer at 1/4 of
+         * the actual lifespan keeps a meaningful safety margin without that collision — pass no
+         * `expiresInSeconds` (e.g. an older stored session) to keep the original 5-minute buffer.
+         */
+        isTokenExpired(expiresAt, expiresInSeconds) {
+          if (!expiresAt) return true;
+          const maxBuffer = 5 * 60 * 1000;
+          const bufferTime = expiresInSeconds
+            ? Math.min(maxBuffer, (expiresInSeconds * 1000) / 4)
+            : maxBuffer;
+          return Date.now() >= (parseInt(expiresAt) - bufferTime);
+        }
+
+        cleanupOAuthState() {
+          localStorage.removeItem(STORAGE_KEYS.codeVerifier);
+        }
+
+        // PKCE Helper Functions
+        generateCodeVerifier() {
+          const array = new Uint8Array(32);
+          crypto.getRandomValues(array);
+          return this.base64UrlEncode(array);
+        }
+
+        async generateCodeChallenge(codeVerifier) {
+          const encoder = new TextEncoder();
+          const data = encoder.encode(codeVerifier);
+          const hash = await crypto.subtle.digest('SHA-256', data);
+          return this.base64UrlEncode(new Uint8Array(hash));
+        }
+
+        base64UrlEncode(array) {
+          return btoa(String.fromCharCode.apply(null, array))
+            .replace(/\+/g, '-')
+            .replace(/\//g, '_')
+            .replace(/=+$/, '');
+        }
+
+        generateRandomString(length) {
+          const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+          let result = '';
+          for (let i = 0; i < length; i++) {
+            result += chars.charAt(Math.floor(Math.random() * chars.length));
+          }
+          return result;
+        }
+      }
+
+      // Tenant Creation Wizard, StripeService, and TenantCreationWizard classes are in tenant-wizard.js
+      const auth = new SideDrawerAuth();
+
+      /** Same SSO contract as SidedrawerRelated presets.js goToConsole — opens Console with ?token= */
+      window.openSideDrawerConsoleSso = async function() {
+        try {
+          const token = await auth.getAccessToken();
+          if (!token) {
+            alert('Could not open Console: your session is not available. Try reloading the page.');
+            return;
+          }
+          const consoleBase = window.sdHosts().console;
+          const url = `${consoleBase}?token=${encodeURIComponent(token)}`;
+          window.open(url, '_blank', 'noopener,noreferrer');
+        } catch (e) {
+          console.error('[openSideDrawerConsoleSso]', e);
+          alert('Could not open Console. Please try again.');
+        }
+      };
+      
+      // Helper function to check session status (can be called from console)
+      window.checkSideDrawerSession = async function() {
+        console.log('🔍 Checking SideDrawer Session Status...');
+        console.log('='.repeat(60));
+        
+        // Check localStorage for session
+        const sessionStr = localStorage.getItem('sdSession');
+        console.log('📦 localStorage key "sdSession":', sessionStr ? 'FOUND' : 'NOT FOUND');
+        
+        if (sessionStr) {
+          try {
+            const session = JSON.parse(sessionStr);
+            console.log('✅ Session object parsed successfully');
+            console.log('  Keys in session:', Object.keys(session));
+            console.log('  Has accessToken:', !!session.accessToken);
+            console.log('  Has refreshToken:', !!session.refreshToken);
+            console.log('  Expires at:', session.expiresAt ? new Date(parseInt(session.expiresAt)).toISOString() : 'N/A');
+            
+            if (session.expiresAt) {
+              const now = Date.now();
+              const expiresAt = parseInt(session.expiresAt);
+              const timeUntilExpiry = Math.floor((expiresAt - now) / 1000);
+              console.log('  Time until expiry:', timeUntilExpiry, 'seconds');
+              console.log('  Is expired:', timeUntilExpiry < 0 ? 'YES ❌' : 'NO ✅');
+            }
+            
+            if (session.refreshToken) {
+              console.log('  Refresh token preview:', session.refreshToken.substring(0, 20) + '...');
+            } else {
+              console.log('  ⚠️ NO REFRESH TOKEN IN SESSION OBJECT!');
+            }
+          } catch (e) {
+            console.error('❌ Failed to parse session:', e);
+          }
+        }
+        
+        // Check localStorage for separate refresh token
+        const refreshTokenKey = 'sidedrawer_refresh_token';
+        const refreshToken = localStorage.getItem(refreshTokenKey);
+        console.log('📦 localStorage key "' + refreshTokenKey + '":', refreshToken ? 'FOUND ✅' : 'NOT FOUND ❌');
+        if (refreshToken) {
+          console.log('  Refresh token preview:', refreshToken.substring(0, 20) + '...');
+        }
+        
+        // Check sessionStorage
+        const sessionStorageStr = sessionStorage.getItem('sdSession');
+        console.log('📦 sessionStorage key "sdSession":', sessionStorageStr ? 'FOUND' : 'NOT FOUND');
+        
+        console.log('='.repeat(60));
+        
+        if (!sessionStr || !refreshToken) {
+          console.log('⚠️ NO REFRESH TOKEN FOUND!');
+          console.log('');
+          console.log('📋 This means:');
+          console.log('  1. Your session was created BEFORE refresh token storage was added');
+          console.log('  2. OR the OAuth response did not include refresh_token');
+          console.log('  3. Session cannot be automatically refreshed');
+          console.log('');
+          console.log('✅ SOLUTION: Re-authenticate to get a fresh session with refresh token');
+          console.log('  - Click "Connect to SideDrawer" button in the widget');
+          console.log('  - OR run: auth.startOAuthFlow()');
+          console.log('');
+          console.log('✅ After re-authentication, refresh token will be stored in:');
+          console.log('  - Session object: sdSession.refreshToken');
+          console.log('  - localStorage: sidedrawer_refresh_token');
+        } else {
+          console.log('✅ Refresh token found! Session can be automatically refreshed.');
+          console.log('💡 Run: auth.checkConnection() to test refresh');
+        }
+      };
+      
+      console.log('💡 Run checkSideDrawerSession() in console to check session status');
+    </script>
+  </body>
+</html>

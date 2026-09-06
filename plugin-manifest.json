@@ -1,0 +1,80 @@
+{
+  "service": "CRM",
+  "cspDomains": {
+    "connect-src": [
+      "https://CHANGE-ME-your-keycloak-host.example.com",
+      "https://localhost:8443",
+      "https://user-api-sbx.sidedrawersbx.com",
+      "https://tenants-gateway-api-sbx.sidedrawersbx.com",
+      "https://api-sbx.sidedrawersbx.com",
+      "https://subscription-api-sbx.sidedrawersbx.com",
+      "https://api.stripe.com",
+      "https://user-api.sidedrawer.com",
+      "https://tenants-gateway-api.sidedrawer.com",
+      "https://api.sidedrawer.com",
+      "https://subscription-api.sidedrawer.com",
+      "https://user-api-dev.sidedrawerdev.com",
+      "https://user-api-stg.sidedrawer.com",
+      "https://tenants-gateway-api-dev.sidedrawerdev.com",
+      "https://api-dev.sidedrawerdev.com",
+      "https://subscription-api-dev.sidedrawerdev.com"
+    ],
+    "script-src": [
+      "https://js.stripe.com"
+    ],
+    "frame-src": [
+      "https://js.stripe.com"
+    ]
+  },
+  "variables": [
+    {
+      "name": "redirect_uri",
+      "label": "OAuth Redirect URI",
+      "defaultValue": "",
+      "isRequired": true,
+      "helpText": "Public URL of this widget. Must match URL in SideDrawer OAuth app settings."
+    },
+    {
+      "name": "client_id",
+      "label": "SideDrawer Client ID",
+      "defaultValue": "",
+      "isRequired": true,
+      "helpText": "OAuth2 Client ID from your SideDrawer OAuth application."
+    },
+    {
+      "name": "keycloak_url",
+      "label": "Keycloak Base URL",
+      "defaultValue": "",
+      "isRequired": false,
+      "helpText": "Base URL of the Keycloak server (e.g. https://auth.example.com). Leave blank, along with Realm, to use the 'preset' value instead."
+    },
+    {
+      "name": "realm",
+      "label": "Keycloak Realm",
+      "defaultValue": "",
+      "isRequired": false,
+      "helpText": "Keycloak realm name. Required together with Keycloak Base URL — if either is blank, 'preset' is used instead."
+    },
+    {
+      "name": "preset",
+      "label": "Realm Preset",
+      "defaultValue": "local",
+      "isRequired": false,
+      "helpText": "Named realm preset to use when Keycloak Base URL/Realm are not both set. Only 'local' (the bundled docker-compose realm) ships built in — add your own environment presets to KC_PRESETS in app/widget.html as they become known. Unrecognised values fall back to 'local'."
+    },
+    {
+      "name": "environment",
+      "label": "Environment (API routing)",
+      "defaultValue": "",
+      "isRequired": false,
+      "helpText": "Only used to pick SideDrawer API hosts when Keycloak Base URL is set and its host isn't one of the built-in presets: 'sandbox', 'production' or 'development'."
+    },
+    {
+      "name": "idp_hint",
+      "label": "Identity Provider Hint",
+      "defaultValue": "",
+      "isRequired": false,
+      "helpText": "Optional Keycloak kc_idp_hint value to skip the realm's login form and go straight to a specific identity provider."
+    }
+  ]
+}

@@ -1,0 +1,48 @@
+# Environment variables
+.env
+.env.local
+.env.production
+
+# Dependencies
+node_modules/
+package-lock.json
+
+# Logs
+*.log
+npm-debug.log*
+ZET-debug.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Certificates
+*.pem
+*.key
+*.crt
+
+# Build output
+dist/
+build/
+*.zip
+
+# Temporary files
+tmp/
+temp/
+.cache/
+
+# Testing
+coverage/
+.nyc_output/
+
+# Local configuration
+config.local.js
+secrets.json
+
