@@ -664,6 +664,7 @@
               try {
                 // IMPORTANT: Try state parameter FIRST (most reliable, can't be stale)
                 let codeVerifier = null;
+                let redirectUriRecoveredFromState = false;
                 const state = urlParams.get('state');
                 console.log('🔍 State parameter from URL:', state ? state.substring(0, 50) + '...' : 'NOT FOUND');
                 
@@ -696,6 +697,7 @@
                     // the parent's redirect_uri must be passed via state to guarantee exact match
                     if (stateData.redirectUri) {
                       OAUTH_CONFIG.redirectUri = stateData.redirectUri;
+                      redirectUriRecoveredFromState = true;
                       console.log('✅ Popup: redirectUri recovered from state:', stateData.redirectUri);
                     }
                   } catch (e) {
@@ -703,12 +705,22 @@
                     console.error('State parsing error details:', e.stack);
                   }
                 }
-                
-                // If redirectUri was not recovered from state (old state format or parse failure),
-                // reconstruct it from the popup's current URL by stripping OAuth callback params
-                if (!OAUTH_CONFIG.redirectUri || OAUTH_CONFIG.redirectUri === (window.location.origin + window.location.pathname)) {
+
+                // Only reconstruct redirect_uri from the popup's current URL as a TRUE last
+                // resort — when state parsing genuinely failed to supply one. Do NOT fall back
+                // to a string-equality check here: a correctly state-recovered redirectUri
+                // legitimately equals `origin + pathname` in the common case (no query string
+                // in the registered redirect URI), which used to make this branch fire even
+                // though state recovery had already succeeded. That mattered under Keycloak
+                // specifically: Keycloak's redirect carries `session_state` and `iss` in
+                // addition to `code`/`state` (Auth0's redirect only ever added the latter two),
+                // and the strip-list below only knew about the Auth0 set — so the "reconstructed"
+                // value silently kept `?session_state=...&iss=...`, which no longer byte-matches
+                // what was sent at /authorize, and Keycloak's token endpoint rejects the exchange
+                // with `invalid_grant: Incorrect redirect_uri`.
+                if (!redirectUriRecoveredFromState) {
                   const popupUrl = new URL(window.location.href);
-                  ['code', 'state', 'error', 'error_description'].forEach(p => popupUrl.searchParams.delete(p));
+                  ['code', 'state', 'error', 'error_description', 'session_state', 'iss'].forEach(p => popupUrl.searchParams.delete(p));
                   OAUTH_CONFIG.redirectUri = popupUrl.toString();
                   console.log('✅ Popup: redirectUri reconstructed from popup URL:', OAUTH_CONFIG.redirectUri);
                 }
