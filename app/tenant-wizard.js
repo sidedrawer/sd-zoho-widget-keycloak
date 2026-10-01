@@ -1940,6 +1940,7 @@ class TenantCreationWizard {
         priceId: signupData.priceId,
         startingQuantity: this.state.totalAdminUsers || 1,
         paymentMethodId: signupData.paymentMethodId,
+        identityProvider: 'keycloak',
         ...(this.state.couponId ? { couponId: this.state.couponId } : {})
       };
 
