@@ -3,6 +3,7 @@
   "cspDomains": {
     "connect-src": [
       "https://CHANGE-ME-your-keycloak-host.example.com",
+      "https://keycloak.sidedrawer.com",
       "https://localhost:8443",
       "https://user-api-sbx.sidedrawersbx.com",
       "https://tenants-gateway-api-sbx.sidedrawersbx.com",

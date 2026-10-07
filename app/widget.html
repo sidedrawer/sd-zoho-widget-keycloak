@@ -83,7 +83,9 @@
       // add real environment presets (production/sandbox/etc.) here once those hosts/realms are
       // known, or just pass keycloak_url+realm explicitly and skip presets entirely.
       const KC_PRESETS = {
-        'local': { base: 'https://localhost:8443', realm: 'sidedrawer-dev', clientId: 'zoho-widget', env: 'development' }
+        'local': { base: 'https://localhost:8443', realm: 'sidedrawer-dev', clientId: 'zoho-widget', env: 'development' },
+        // No default clientId: supply client_id explicitly (URL param / Zoho config).
+        'production': { base: 'https://keycloak.sidedrawer.com', realm: 'sidedrawer-prod', env: 'production' }
       };
       const DEFAULT_PRESET = 'local';
 
@@ -178,7 +180,13 @@
 
       // Resolve the realm: an explicit keycloak_url+realm pair wins outright; otherwise fall
       // back to a named preset (from URL/state/Zoho config, defaulting to 'local').
-      if (explicitKeycloakUrl && explicitRealm) {
+      if (callbackState && callbackState.issuer) {
+        // The authorize step encodes the full issuer in `state`; use it verbatim so the code is
+        // POSTed to the same realm that issued it (not a preset fallback).
+        applyIssuerToConfig(callbackState.issuer.replace(/\/$/, ''), callbackState.realm || explicitRealm, 'from OAuth state');
+        OAUTH_CONFIG.env = callbackState.env
+          || envForOrigin(new URL(callbackState.issuer).origin) || 'sandbox';
+      } else if (explicitKeycloakUrl && explicitRealm) {
         const base = explicitKeycloakUrl.replace(/\/$/, '');
         applyIssuerToConfig(`${base}/realms/${explicitRealm}`, explicitRealm, 'from explicit keycloak_url+realm');
         OAUTH_CONFIG.env = envForOrigin(new URL(base).origin)
