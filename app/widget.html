@@ -594,7 +594,11 @@
               // Realm (REQUIRED for Keycloak — an explicit keycloak_url+realm pair wins outright,
               // otherwise a named preset). Only applied when this variable exists at all, so an
               // admin who never fills it in keeps whatever URL param already resolved.
-              if (config.keycloak_url && config.keycloak_url.trim() && config.realm && config.realm.trim()) {
+              if (explicitKeycloakUrl && explicitRealm) {
+                // Explicit URL params (this tab's own link) win over the extension-wide Zoho
+                // variables; otherwise a sandbox value there silently overrides a prod tab.
+                console.log('✓ Keeping realm from URL params; ignoring Zoho keycloak_url/realm');
+              } else if (config.keycloak_url && config.keycloak_url.trim() && config.realm && config.realm.trim()) {
                 const base = config.keycloak_url.trim().replace(/\/$/, '');
                 const realm = config.realm.trim();
                 applyIssuerToConfig(`${base}/realms/${realm}`, realm, 'from Zoho config');
