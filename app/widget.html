@@ -84,7 +84,11 @@
       // known, or just pass keycloak_url+realm explicitly and skip presets entirely.
       const KC_PRESETS = {
         'local': { base: 'https://localhost:8443', realm: 'sidedrawer-dev', clientId: 'zoho-widget', env: 'development' },
+        // The SidedrawerRelated container loads this widget with only ?client_id=…&env=<environment>
+        // (its `environment` Zoho variable), so env names must map to a realm here — otherwise
+        // they fall through to 'local' and the login hits localhost:8443.
         // No default clientId: supply client_id explicitly (URL param / Zoho config).
+        'sandbox': { base: 'https://admin-kc-sbx.sidedrawersbx.com', realm: 'sidedrawer-sbx', env: 'sandbox' },
         'production': { base: 'https://keycloak.sidedrawer.com', realm: 'sidedrawer-prod', env: 'production' }
       };
       const DEFAULT_PRESET = 'local';
