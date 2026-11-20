@@ -210,6 +210,17 @@
         OAUTH_CONFIG.redirectUri = `${selfUrl}?client_id=${OAUTH_CONFIG.clientId}`;
       }
 
+      // A fresh load that carries query params is a new webtab entry, so its URL is the whole
+      // wizard config: drop any stored value it omits. Otherwise a coupon/price saved by an
+      // earlier load in this tab (e.g. a sandbox coupon) leaks into a webtab configured without
+      // one. Param-less loads (after the callback's replaceState, or location.reload()) keep
+      // the stored values, since that is the only place they survive the OAuth round-trip.
+      if (!isOAuthCallback && window.location.search) {
+        ['coupon_id', 'stripe_price'].forEach((key) => {
+          if (!urlParams.has(key)) sessionStorage.removeItem('sd_config_' + key);
+        });
+      }
+
       // Persist wizard-specific params through OAuth redirect so they survive the round-trip.
       // `configuredStripePriceId` also gates tenant creation below — read once here, since
       // neither the URL nor sessionStorage changes for the rest of this page's lifetime.
